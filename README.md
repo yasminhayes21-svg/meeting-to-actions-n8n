@@ -13,7 +13,7 @@ Form (transcript) -> Gemini (structured JSON) -> Parse -> Review page: approve?
 ## What it does
 
 1. **Intake.** An n8n form takes the meeting title, date and the pasted transcript.
-2. **Extraction.** Gemini returns strict JSON: a three-sentence summary, the decisions, and action items with owner, task and due date. No owner, no action.
+2. **Extraction.** Gemini (`gemini-flash-lite-latest`, free tier) returns strict JSON: a three-sentence summary, the decisions, and action items with owner, task and due date. No owner, no action. The call times out after 60 seconds and retries three times, because a busy model can hang instead of failing.
 3. **Parsing.** A Code node validates the JSON and fails loudly if the model drifts, instead of writing garbage downstream. Model output is escaped before it is shown on a page.
 4. **Human in the loop.** The next form page shows the summary, decisions and action items, and asks the person to approve or decline. Nothing is saved until someone approves.
 5. **Logging.** On approval, one row per action item goes into the n8n data table `meeting_actions`, status `open`. The workflow creates the table on its first run.
@@ -44,7 +44,7 @@ Open the Gemini node, create the Header Auth credential, and save the workflow.
 ## Try it
 
 1. Click **Execute workflow**. The form opens in a new tab.
-2. Paste `fixtures/sample-transcript.md`, a made-up leadership meeting with four action items.
+2. Paste `fixtures/sample-transcript.md`, a made-up leadership meeting.
 3. Approve on the review page.
 4. Check the rows under **Overview, Data tables, meeting_actions**.
 

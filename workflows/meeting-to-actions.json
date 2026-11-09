@@ -37,13 +37,15 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "sendBody": true,
         "specifyBody": "json",
         "jsonBody": "={{ JSON.stringify({\n  system_instruction: { parts: [{ text: 'You turn meeting transcripts into structured output. Reply with JSON only. Schema: {\"summary\": string (3 sentences max), \"decisions\": [string], \"actions\": [{\"owner\": string, \"task\": string, \"due\": string}]}. An action needs a named owner from the transcript. If no due date is stated, write \"not stated\".' }] },\n  contents: [{ role: 'user', parts: [{ text: 'Meeting: ' + $json['Meeting title'] + ' (' + $json['Meeting date'] + ')\\n\\nTranscript:\\n' + $json['Transcript'] }] }],\n  generationConfig: { responseMimeType: 'application/json', temperature: 0.2 }\n}) }}",
-        "options": {}
+        "options": {
+          "timeout": 60000
+        }
       },
       "name": "Extract decisions and actions (Gemini)",
       "type": "n8n-nodes-base.httpRequest",
@@ -51,7 +53,10 @@
       "position": [
         240,
         0
-      ]
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
     },
     {
       "parameters": {
