@@ -4,7 +4,7 @@
     {
       "parameters": {
         "formTitle": "Meeting to actions",
-        "formDescription": "Paste a meeting transcript. The workflow extracts the decisions and action items, logs the actions to a sheet, and sends the recap once a human approves it.",
+        "formDescription": "Paste a meeting transcript. Gemini extracts the decisions and action items, you review them, and only approved actions are saved to the meeting_actions data table.",
         "formFields": {
           "values": [
             {
@@ -25,14 +25,14 @@
         },
         "options": {}
       },
-      "id": "a1",
       "name": "Meeting transcript",
       "type": "n8n-nodes-base.formTrigger",
       "typeVersion": 2.2,
       "position": [
         0,
         0
-      ]
+      ],
+      "webhookId": "meeting-to-actions"
     },
     {
       "parameters": {
@@ -45,95 +45,76 @@
         "jsonBody": "={{ JSON.stringify({\n  system_instruction: { parts: [{ text: 'You turn meeting transcripts into structured output. Reply with JSON only. Schema: {\"summary\": string (3 sentences max), \"decisions\": [string], \"actions\": [{\"owner\": string, \"task\": string, \"due\": string}]}. An action needs a named owner from the transcript. If no due date is stated, write \"not stated\".' }] },\n  contents: [{ role: 'user', parts: [{ text: 'Meeting: ' + $json['Meeting title'] + ' (' + $json['Meeting date'] + ')\\n\\nTranscript:\\n' + $json['Transcript'] }] }],\n  generationConfig: { responseMimeType: 'application/json', temperature: 0.2 }\n}) }}",
         "options": {}
       },
-      "id": "a2",
       "name": "Extract decisions and actions (Gemini)",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        260,
+        240,
         0
       ]
     },
     {
       "parameters": {
-        "jsCode": "// Parse the model output and attach the meeting details.\nconst meeting = $('Meeting transcript').first().json;\nlet text = $input.first().json.candidates?.[0]?.content?.parts?.[0]?.text ?? '';\ntext = text.replace(/^```(?:json)?\\s*/i, '').replace(/```\\s*$/i, '').trim();\n\nlet parsed;\ntry {\n  parsed = JSON.parse(text);\n} catch (e) {\n  throw new Error('The model did not return valid JSON. Raw output: ' + text.slice(0, 300));\n}\n\nconst actions = (parsed.actions ?? []).map(a => ({\n  meeting: meeting['Meeting title'],\n  date: meeting['Meeting date'],\n  owner: a.owner ?? 'unassigned',\n  task: a.task ?? '',\n  due: a.due ?? 'not stated',\n  status: 'open',\n}));\n\nconst recapHtml = `\n<h2>${meeting['Meeting title']} (${meeting['Meeting date']})</h2>\n<p>${parsed.summary ?? ''}</p>\n<h3>Decisions</h3>\n<ul>${(parsed.decisions ?? []).map(d => `<li>${d}</li>`).join('')}</ul>\n<h3>Action items</h3>\n<ul>${actions.map(a => `<li><b>${a.owner}</b>: ${a.task} (due ${a.due})</li>`).join('')}</ul>`;\n\nreturn [{\n  json: {\n    meeting: meeting['Meeting title'],\n    date: meeting['Meeting date'],\n    summary: parsed.summary ?? '',\n    decisions: parsed.decisions ?? [],\n    actions,\n    actionCount: actions.length,\n    recapHtml,\n  }\n}];"
+        "jsCode": "// Parse the model output and attach the meeting details.\nconst meeting = $('Meeting transcript').first().json;\nlet text = $input.first().json.candidates?.[0]?.content?.parts?.[0]?.text ?? '';\ntext = text.replace(/^```(?:json)?\\s*/i, '').replace(/```\\s*$/i, '').trim();\n\nlet parsed;\ntry {\n  parsed = JSON.parse(text);\n} catch (e) {\n  throw new Error('The model did not return valid JSON. Raw output: ' + text.slice(0, 300));\n}\n\n// Model output is shown on a web page, so escape it.\nconst esc = s => String(s ?? '').replace(/[&<>\"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' }[c]));\n\nconst actions = (parsed.actions ?? []).map(a => ({\n  meeting: String(meeting['Meeting title'] ?? ''),\n  date: String(meeting['Meeting date'] ?? ''),\n  owner: String(a.owner ?? 'unassigned'),\n  task: String(a.task ?? ''),\n  due: String(a.due ?? 'not stated'),\n  status: 'open',\n}));\nconst decisions = (parsed.decisions ?? []).map(String);\n\nconst recapHtml = `\n<h3>${esc(meeting['Meeting title'])} (${esc(meeting['Meeting date'])})</h3>\n<p>${esc(parsed.summary)}</p>\n<h4>Decisions</h4>\n<ul>${decisions.map(d => `<li>${esc(d)}</li>`).join('') || '<li>none</li>'}</ul>\n<h4>Action items</h4>\n<ul>${actions.map(a => `<li><b>${esc(a.owner)}</b>: ${esc(a.task)} (due ${esc(a.due)})</li>`).join('') || '<li>none</li>'}</ul>`;\n\nreturn [{\n  json: {\n    meeting: meeting['Meeting title'],\n    date: meeting['Meeting date'],\n    summary: parsed.summary ?? '',\n    decisions,\n    actions,\n    actionCount: actions.length,\n    recapHtml,\n  }\n}];"
       },
-      "id": "a3",
       "name": "Parse model output",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        520,
+        480,
         0
       ]
     },
     {
-      "parameters": {
-        "fieldToSplitOut": "actions",
-        "options": {}
-      },
-      "id": "a4",
-      "name": "One item per action",
-      "type": "n8n-nodes-base.splitOut",
-      "typeVersion": 1,
+      "name": "Review and approve",
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 2.5,
       "position": [
-        780,
-        -160
-      ]
+        720,
+        0
+      ],
+      "webhookId": "review-and-approve",
+      "parameters": {
+        "operation": "page",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Extracted from the transcript",
+              "fieldType": "html",
+              "html": "={{ $json.recapHtml }}"
+            },
+            {
+              "fieldLabel": "Decision",
+              "fieldType": "radio",
+              "fieldOptions": {
+                "values": [
+                  {
+                    "option": "Approve and save the actions"
+                  },
+                  {
+                    "option": "Decline, save nothing"
+                  }
+                ]
+              },
+              "requiredField": true
+            }
+          ]
+        },
+        "options": {
+          "formTitle": "Review before anything is saved",
+          "formDescription": "A person decides. Nothing is saved until you approve.",
+          "buttonLabel": "Submit decision"
+        }
+      }
     },
     {
-      "parameters": {
-        "operation": "append",
-        "documentId": {
-          "__rl": true,
-          "mode": "id",
-          "value": "YOUR_GOOGLE_SHEET_ID"
-        },
-        "sheetName": {
-          "__rl": true,
-          "mode": "name",
-          "value": "Actions"
-        },
-        "columns": {
-          "mappingMode": "autoMapInputData",
-          "value": {},
-          "matchingColumns": [],
-          "schema": []
-        },
-        "options": {}
-      },
-      "id": "a5",
-      "name": "Log actions to sheet",
-      "type": "n8n-nodes-base.googleSheets",
-      "typeVersion": 4.5,
+      "name": "Approved?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
       "position": [
-        1040,
-        -160
-      ]
-    },
-    {
-      "parameters": {
-        "operation": "sendAndWait",
-        "sendTo": "YOUR_EMAIL@example.com",
-        "subject": "=Approve the recap: {{ $json.meeting }}",
-        "message": "=The recap below goes to the team once you approve it.\n\n{{ $json.summary }}\n\nDecisions: {{ $json.decisions.join(' | ') }}\n\nAction items logged: {{ $json.actionCount }}",
-        "approvalOptions": {
-          "values": {
-            "approvalType": "double"
-          }
-        },
-        "options": {}
-      },
-      "id": "a6",
-      "name": "Human approval",
-      "type": "n8n-nodes-base.gmail",
-      "typeVersion": 2.1,
-      "position": [
-        780,
-        120
-      ]
-    },
-    {
+        960,
+        0
+      ],
       "parameters": {
         "conditions": {
           "options": {
@@ -145,63 +126,132 @@
           "conditions": [
             {
               "id": "c1",
-              "leftValue": "={{ $json.data.approved }}",
-              "rightValue": true,
+              "leftValue": "={{ $json.Decision }}",
+              "rightValue": "Approve and save the actions",
               "operator": {
-                "type": "boolean",
-                "operation": "true",
-                "singleValue": true
+                "type": "string",
+                "operation": "equals"
               }
             }
           ],
           "combinator": "and"
         },
         "options": {}
-      },
-      "id": "a7",
-      "name": "Approved?",
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2.2,
+      }
+    },
+    {
+      "name": "Create the table if missing",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
       "position": [
-        1040,
+        1200,
+        -120
+      ],
+      "parameters": {
+        "resource": "table",
+        "operation": "create",
+        "tableName": "meeting_actions",
+        "columns": {
+          "column": [
+            {
+              "name": "meeting",
+              "type": "string"
+            },
+            {
+              "name": "date",
+              "type": "string"
+            },
+            {
+              "name": "owner",
+              "type": "string"
+            },
+            {
+              "name": "task",
+              "type": "string"
+            },
+            {
+              "name": "due",
+              "type": "string"
+            },
+            {
+              "name": "status",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {
+          "createIfNotExists": true
+        }
+      }
+    },
+    {
+      "name": "One item per action",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        -120
+      ],
+      "parameters": {
+        "jsCode": "// One item per approved action, ready for the data table.\nreturn $('Parse model output').first().json.actions.map(a => ({ json: a }));"
+      }
+    },
+    {
+      "name": "Save actions",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1680,
+        -120
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "meeting_actions"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      }
+    },
+    {
+      "name": "Show the recap",
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 2.5,
+      "position": [
+        1920,
+        -120
+      ],
+      "webhookId": "show-the-recap",
+      "executeOnce": true,
+      "parameters": {
+        "operation": "completion",
+        "respondWith": "showText",
+        "responseText": "={{ '<h2>Approved</h2><p>' + $('Parse model output').first().json.actionCount + ' action items saved to the meeting_actions data table.</p>' + $('Parse model output').first().json.recapHtml }}"
+      }
+    },
+    {
+      "name": "Declined",
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 2.5,
+      "position": [
+        1200,
         120
-      ]
-    },
-    {
+      ],
+      "webhookId": "declined",
       "parameters": {
-        "sendTo": "TEAM_LIST@example.com",
-        "subject": "=Recap: {{ $('Parse model output').first().json.meeting }} ({{ $('Parse model output').first().json.date }})",
-        "message": "={{ $('Parse model output').first().json.recapHtml }}",
-        "options": {
-          "appendAttribution": false
-        }
-      },
-      "id": "a8",
-      "name": "Send recap to the team",
-      "type": "n8n-nodes-base.gmail",
-      "typeVersion": 2.1,
-      "position": [
-        1300,
-        40
-      ]
-    },
-    {
-      "parameters": {
-        "sendTo": "YOUR_EMAIL@example.com",
-        "subject": "=Recap not sent: {{ $('Parse model output').first().json.meeting }}",
-        "message": "You declined the recap, so nothing went to the team. The action items are still in the sheet, edit them there and re-run if needed.",
-        "options": {
-          "appendAttribution": false
-        }
-      },
-      "id": "a9",
-      "name": "Tell the owner it was declined",
-      "type": "n8n-nodes-base.gmail",
-      "typeVersion": 2.1,
-      "position": [
-        1300,
-        220
-      ]
+        "operation": "completion",
+        "respondWith": "text",
+        "completionTitle": "Declined",
+        "completionMessage": "Nothing was saved. Edit the transcript and run it again if needed."
+      }
     }
   ],
   "connections": {
@@ -216,34 +266,29 @@
         ]
       ]
     },
+    "Extract decisions and actions (Gemini)": {
+      "main": [
+        [
+          {
+            "node": "Parse model output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
     "Parse model output": {
       "main": [
         [
           {
-            "node": "One item per action",
-            "type": "main",
-            "index": 0
-          },
-          {
-            "node": "Human approval",
+            "node": "Review and approve",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "One item per action": {
-      "main": [
-        [
-          {
-            "node": "Log actions to sheet",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Human approval": {
+    "Review and approve": {
       "main": [
         [
           {
@@ -258,25 +303,47 @@
       "main": [
         [
           {
-            "node": "Send recap to the team",
+            "node": "Create the table if missing",
             "type": "main",
             "index": 0
           }
         ],
         [
           {
-            "node": "Tell the owner it was declined",
+            "node": "Declined",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Extract decisions and actions (Gemini)": {
+    "Create the table if missing": {
       "main": [
         [
           {
-            "node": "Parse model output",
+            "node": "One item per action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "One item per action": {
+      "main": [
+        [
+          {
+            "node": "Save actions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save actions": {
+      "main": [
+        [
+          {
+            "node": "Show the recap",
             "type": "main",
             "index": 0
           }
