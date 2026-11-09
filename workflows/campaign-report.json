@@ -1,0 +1,330 @@
+{
+  "name": "Campaign results report",
+  "nodes": [
+    {
+      "name": "Upload campaign export",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.2,
+      "webhookId": "campaign-report",
+      "parameters": {
+        "formTitle": "Campaign results report",
+        "formDescription": "Upload an email campaign export. The rates are computed in code, Gemini writes the commentary, and every number it uses is checked against the data.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Report title",
+              "placeholder": "e.g. November email results",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Campaign export CSV",
+              "fieldType": "file",
+              "multipleFiles": false,
+              "acceptFileTypes": ".csv",
+              "requiredField": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "name": "Read the CSV",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "parameters": {
+        "operation": "csv",
+        "binaryPropertyName": "Campaign_export_CSV",
+        "options": {}
+      },
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "name": "Compute the metrics",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "// Compute the rates in code, so the numbers in the report never come from the model.\nconst rows = $('Read the CSV').all().map(i => i.json);\nconst required = ['campaign', 'send_date', 'audience', 'emails_sent', 'hard_bounces', 'unique_opens', 'unique_clicks', 'unsubscribes'];\nconst missing = required.filter(c => !(c in (rows[0] ?? {})));\nif (!rows.length || missing.length) {\n  throw new Error('The CSV is missing columns: ' + (missing.join(', ') || 'no rows found'));\n}\nconst n = v => Number(String(v).replace(/,/g, '')) || 0;\nconst pct = (a, b) => b ? Math.round(a / b * 1000) / 10 : 0;\n\nconst campaigns = rows.map(r => {\n  const sent = n(r.emails_sent), bounces = n(r.hard_bounces), opens = n(r.unique_opens), clicks = n(r.unique_clicks), unsubs = n(r.unsubscribes);\n  const delivered = sent - bounces;\n  const c = {\n    campaign: String(r.campaign), send_date: String(r.send_date), audience: String(r.audience),\n    sent, delivered,\n    open_rate: pct(opens, delivered), click_rate: pct(clicks, delivered), click_to_open: pct(clicks, opens),\n    unsubscribe_rate: pct(unsubs, delivered), bounce_rate: pct(bounces, sent),\n  };\n  const flags = [];\n  if (c.bounce_rate > 2) flags.push('bounce rate above 2%: clean the list');\n  if (c.unsubscribe_rate > 0.5) flags.push('unsubscribes above 0.5%: check targeting and frequency');\n  if (c.open_rate < 20) flags.push('open rate below 20%: test the subject line');\n  c.flags = flags.join('; ');\n  return c;\n});\n\nconst sum = k => rows.reduce((t, r) => t + n(r[k]), 0);\nconst delivered = sum('emails_sent') - sum('hard_bounces');\nconst totals = {\n  campaigns: campaigns.length, sent: sum('emails_sent'), delivered,\n  open_rate: pct(sum('unique_opens'), delivered), click_rate: pct(sum('unique_clicks'), delivered),\n  unsubscribe_rate: pct(sum('unsubscribes'), delivered),\n};\nconst byClicks = [...campaigns].sort((a, b) => b.click_rate - a.click_rate);\n\n// What the model sees: the same numbers, with rates written as percentages.\nconst asPct = o => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, k.endsWith('_rate') || k === 'click_to_open' ? v + '%' : v]));\nconst forModel = {\n  totals: asPct(totals),\n  best_by_click_rate: byClicks[0].campaign,\n  weakest_by_click_rate: byClicks[byClicks.length - 1].campaign,\n  campaigns: campaigns.map(asPct),\n};\nreturn [{ json: {\n  title: $('Upload campaign export').first().json['Report title'],\n  campaigns, totals, forModel,\n} }];"
+      },
+      "position": [
+        480,
+        0
+      ]
+    },
+    {
+      "name": "Write the commentary (Gemini)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  system_instruction: { parts: [{ text: 'You write the commentary for an email campaign report read by a marketing team lead. Use only numbers that appear in the data, written exactly as they appear there; never calculate new ones. Keep the % sign on rates. Reply with JSON only. Schema: {\"headline\": string (one sentence), \"points\": [string, string, string] (what worked, what did not, what to change next time)}.' }] },\n  contents: [{ role: 'user', parts: [{ text: JSON.stringify($json.forModel) }] }],\n  generationConfig: { responseMimeType: 'application/json', temperature: 0.2 }\n}) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput",
+      "position": [
+        720,
+        0
+      ]
+    },
+    {
+      "name": "Check the numbers and build the report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "// Check every number in the commentary against the data, then build the report page.\nconst m = $('Compute the metrics').first().json;\nconst out = $input.first().json;\nconst esc = s => String(s ?? '').replace(/[&<>\"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' }[c]));\n\nlet ai = null;\ntry {\n  let text = out.candidates?.[0]?.content?.parts?.[0]?.text ?? '';\n  text = text.replace(/^```(?:json)?\\s*/i, '').replace(/```\\s*$/i, '').trim();\n  ai = JSON.parse(text);\n} catch (e) {\n  ai = null;\n}\n\n// Every number that may appear: the metrics, the counts, and the digits in names and dates.\nconst allowed = new Set();\nconst addNums = v => String(v).match(/\\d+(?:\\.\\d+)?/g)?.forEach(x => allowed.add(String(Number(x))));\nObject.values(m.totals).forEach(addNums);\nm.campaigns.forEach(c => Object.values(c).forEach(addNums));\n[2, 0.5, 20].forEach(addNums);\n\nlet commentaryHtml, unverified = [];\nif (!ai || !ai.headline) {\n  commentaryHtml = '<p><i>No commentary: the model did not answer. The numbers below are complete.</i></p>';\n} else {\n  const text = [ai.headline, ...(ai.points ?? [])].join(' ');\n  unverified = [...new Set((text.replace(/,(?=\\d{3})/g, '').match(/\\d+(?:\\.\\d+)?/g) ?? []).map(x => String(Number(x))))]\n    .filter(x => !allowed.has(x));\n  commentaryHtml = `<p><b>${esc(ai.headline)}</b></p><ul>${(ai.points ?? []).map(p => `<li>${esc(p)}</li>`).join('')}</ul>` +\n    (unverified.length\n      ? `<p style=\"color:#b00020\"><b>Check before sending:</b> the commentary mentions ${esc(unverified.join(', '))}, which is not in the data.</p>`\n      : '<p style=\"color:#2e7d32\">Every number in the commentary matches the data.</p>');\n}\n\nconst t = m.totals;\nconst table = `<table border=\"1\" cellpadding=\"6\" style=\"border-collapse:collapse;font-size:14px\">\n<tr><th>Campaign</th><th>Sent</th><th>Open</th><th>Click</th><th>Click to open</th><th>Unsub</th><th>Bounce</th><th>Flags</th></tr>\n${m.campaigns.map(c => `<tr><td>${esc(c.campaign)}<br><small>${esc(c.send_date)}, ${esc(c.audience)}</small></td><td>${c.sent}</td><td>${c.open_rate}%</td><td>${c.click_rate}%</td><td>${c.click_to_open}%</td><td>${c.unsubscribe_rate}%</td><td>${c.bounce_rate}%</td><td>${esc(c.flags)}</td></tr>`).join('')}\n<tr><td><b>All ${t.campaigns}</b></td><td>${t.sent}</td><td>${t.open_rate}%</td><td>${t.click_rate}%</td><td></td><td>${t.unsubscribe_rate}%</td><td></td><td></td></tr></table>`;\n\nconst reportHtml = `<h2>${esc(m.title)}</h2>${commentaryHtml}${table}<p>Saved to the campaign_metrics data table.</p>`;\nreturn [{ json: { reportHtml, unverified } }];"
+      },
+      "position": [
+        960,
+        0
+      ]
+    },
+    {
+      "name": "Create the table if missing",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "parameters": {
+        "resource": "table",
+        "operation": "create",
+        "tableName": "campaign_metrics",
+        "columns": {
+          "column": [
+            {
+              "name": "report",
+              "type": "string"
+            },
+            {
+              "name": "campaign",
+              "type": "string"
+            },
+            {
+              "name": "send_date",
+              "type": "string"
+            },
+            {
+              "name": "audience",
+              "type": "string"
+            },
+            {
+              "name": "sent",
+              "type": "number"
+            },
+            {
+              "name": "delivered",
+              "type": "number"
+            },
+            {
+              "name": "open_rate",
+              "type": "number"
+            },
+            {
+              "name": "click_rate",
+              "type": "number"
+            },
+            {
+              "name": "click_to_open",
+              "type": "number"
+            },
+            {
+              "name": "unsubscribe_rate",
+              "type": "number"
+            },
+            {
+              "name": "bounce_rate",
+              "type": "number"
+            },
+            {
+              "name": "flags",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {
+          "createIfNotExists": true
+        }
+      },
+      "position": [
+        1200,
+        0
+      ]
+    },
+    {
+      "name": "One row per campaign",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "// One row per campaign for the data table.\nconst title = $('Compute the metrics').first().json.title;\nreturn $('Compute the metrics').first().json.campaigns.map(c => ({ json: { report: String(title), ...c } }));"
+      },
+      "position": [
+        1440,
+        0
+      ]
+    },
+    {
+      "name": "Save the metrics",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "parameters": {
+        "resource": "row",
+        "operation": "upsert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "campaign_metrics"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "campaign",
+              "condition": "eq",
+              "keyValue": "={{ $json.campaign }}"
+            },
+            {
+              "keyName": "send_date",
+              "condition": "eq",
+              "keyValue": "={{ $json.send_date }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "position": [
+        1680,
+        0
+      ]
+    },
+    {
+      "name": "Show the report",
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 2.5,
+      "webhookId": "campaign-report-done",
+      "executeOnce": true,
+      "parameters": {
+        "operation": "completion",
+        "respondWith": "showText",
+        "responseText": "={{ $('Check the numbers and build the report').first().json.reportHtml }}"
+      },
+      "position": [
+        1920,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Upload campaign export": {
+      "main": [
+        [
+          {
+            "node": "Read the CSV",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read the CSV": {
+      "main": [
+        [
+          {
+            "node": "Compute the metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute the metrics": {
+      "main": [
+        [
+          {
+            "node": "Write the commentary (Gemini)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write the commentary (Gemini)": {
+      "main": [
+        [
+          {
+            "node": "Check the numbers and build the report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check the numbers and build the report": {
+      "main": [
+        [
+          {
+            "node": "Create the table if missing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create the table if missing": {
+      "main": [
+        [
+          {
+            "node": "One row per campaign",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "One row per campaign": {
+      "main": [
+        [
+          {
+            "node": "Save the metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save the metrics": {
+      "main": [
+        [
+          {
+            "node": "Show the report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

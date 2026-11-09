@@ -1,0 +1,285 @@
+{
+  "name": "Lead scoring with a backtest",
+  "nodes": [
+    {
+      "name": "Upload leads",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.2,
+      "webhookId": "lead-scoring",
+      "parameters": {
+        "formTitle": "Lead scoring with a backtest",
+        "formDescription": "Upload a CSV of leads. Each lead gets a score, a tier and the reasons. If the file says which leads converted, the workflow checks whether the tiers would have predicted it.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Leads CSV",
+              "fieldType": "file",
+              "multipleFiles": false,
+              "acceptFileTypes": ".csv",
+              "requiredField": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "name": "Read the CSV",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "parameters": {
+        "operation": "csv",
+        "binaryPropertyName": "Leads_CSV",
+        "options": {}
+      },
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "name": "Scoring rules (edit me)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "// The scoring rules. Edit the points and lists here; nothing else needs to change.\nreturn [{ json: {\n  fit: {\n    employees: [ { min: 200, points: 25 }, { min: 50, points: 15 }, { min: 10, points: 5 } ],\n    industries: { points: 15, values: ['Software', 'Financial services', 'Logistics', 'Retail'] },\n    countries: { points: 10, values: ['DE', 'AT', 'CH', 'NL', 'ES', 'GB'] },\n    seniority: { points: 15, keywords: ['head', 'director', 'vp', 'chief', 'founder', 'lead'] },\n  },\n  engagement: {\n    demoRequested: 20,\n    websiteVisits: { pointsEach: 1, max: 10 },\n    emailClicks: { pointsEach: 2, max: 10 },\n  },\n  tiers: { A: 70, B: 40 },\n} }];"
+      },
+      "position": [
+        480,
+        0
+      ]
+    },
+    {
+      "name": "Score each lead",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "// Score every lead with the rules and keep the reasons, so a sales rep can see why.\nconst R = $('Scoring rules (edit me)').first().json;\nconst leads = $('Read the CSV').all().map(i => i.json);\nconst required = ['lead_id', 'company', 'industry', 'employees', 'country', 'job_title', 'website_visits_30d', 'email_clicks_30d', 'requested_demo'];\nconst missing = required.filter(c => !(c in (leads[0] ?? {})));\nif (!leads.length || missing.length) {\n  throw new Error('The CSV is missing columns: ' + (missing.join(', ') || 'no rows found'));\n}\n\nreturn leads.map(l => {\n  const reasons = [];\n  let score = 0;\n  const add = (points, why) => { if (points) { score += points; reasons.push(`${why} +${points}`); } };\n\n  const emp = Number(l.employees) || 0;\n  const band = R.fit.employees.find(b => emp >= b.min);\n  if (band) add(band.points, `${band.min}+ employees`);\n  if (R.fit.industries.values.includes(l.industry)) add(R.fit.industries.points, l.industry);\n  if (R.fit.countries.values.includes(l.country)) add(R.fit.countries.points, `market ${l.country}`);\n  const title = String(l.job_title).toLowerCase();\n  if (R.fit.seniority.keywords.some(k => title.split(/\\W+/).includes(k))) add(R.fit.seniority.points, 'senior buyer');\n  if (String(l.requested_demo).toLowerCase() === 'yes') add(R.engagement.demoRequested, 'requested a demo');\n  add(Math.min(R.engagement.websiteVisits.max, (Number(l.website_visits_30d) || 0) * R.engagement.websiteVisits.pointsEach), 'site visits');\n  add(Math.min(R.engagement.emailClicks.max, (Number(l.email_clicks_30d) || 0) * R.engagement.emailClicks.pointsEach), 'email clicks');\n\n  score = Math.min(100, score);\n  const tier = score >= R.tiers.A ? 'A' : score >= R.tiers.B ? 'B' : 'C';\n  const outcome = String(l.converted ?? '').toLowerCase();\n  return { json: {\n    lead_id: String(l.lead_id), company: String(l.company), score, tier,\n    reasons: reasons.join('; '),\n    known_outcome: ['yes', 'no'].includes(outcome) ? outcome : '',\n  } };\n});"
+      },
+      "position": [
+        720,
+        0
+      ]
+    },
+    {
+      "name": "Backtest",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "// Backtest: do higher tiers convert more often than the average lead?\nconst scored = $input.all().map(i => i.json);\nconst esc = s => String(s ?? '').replace(/[&<>\"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' }[c]));\nconst runId = 'run-' + String($execution.id).padStart(4, '0');\nconst known = scored.filter(l => l.known_outcome);\nconst pct = x => (Math.round(x * 1000) / 10) + '%';\n\nlet verdict, tableHtml = '';\nif (!known.length) {\n  verdict = 'No outcomes in the file, so no backtest. Scores are saved as a shadow run only.';\n} else {\n  const base = known.filter(l => l.known_outcome === 'yes').length / known.length;\n  const rows = ['A', 'B', 'C'].map(t => {\n    const inTier = known.filter(l => l.tier === t);\n    const won = inTier.filter(l => l.known_outcome === 'yes').length;\n    const rate = inTier.length ? won / inTier.length : 0;\n    return { t, n: inTier.length, won, rate, lift: base ? rate / base : 0 };\n  });\n  const [a, b, c] = rows;\n  const ordered = a.rate >= b.rate && b.rate >= c.rate;\n  const ready = ordered && a.lift >= 2 && a.n >= 5;\n  verdict = ready\n    ? `Tier A converts at ${a.lift.toFixed(1)} times the average. The rules are ready for a shadow run next to the CRM.`\n    : `The tiers do not separate well enough yet (tier A lift ${a.lift.toFixed(1)}, needs 2.0 with tiers in order). Adjust the rules before going live.`;\n  tableHtml = `<table border=\"1\" cellpadding=\"6\" style=\"border-collapse:collapse\">\n<tr><th>Tier</th><th>Leads</th><th>Converted</th><th>Rate</th><th>Lift vs average</th></tr>\n${rows.map(r => `<tr><td>${r.t}</td><td>${r.n}</td><td>${r.won}</td><td>${pct(r.rate)}</td><td>${r.lift.toFixed(1)}</td></tr>`).join('')}\n<tr><td>All</td><td>${known.length}</td><td>${known.filter(l => l.known_outcome === 'yes').length}</td><td>${pct(base)}</td><td>1.0</td></tr></table>`;\n}\n\nconst top = [...scored].sort((x, y) => y.score - x.score).slice(0, 5);\nconst summaryHtml = `\n<h2>Lead scoring, ${esc(runId)}</h2>\n<p>${scored.length} leads scored and saved to the lead_scores data table as a shadow run. Nothing was written to a CRM.</p>\n<h3>Backtest</h3>\n${tableHtml}\n<p><b>${esc(verdict)}</b></p>\n<h3>Top five</h3>\n<ul>${top.map(l => `<li><b>${esc(l.company)}</b> (${esc(l.lead_id)}), score ${l.score}, tier ${l.tier}: ${esc(l.reasons)}</li>`).join('')}</ul>`;\n\nreturn [{ json: { runId, verdict, summaryHtml } }];"
+      },
+      "position": [
+        960,
+        0
+      ]
+    },
+    {
+      "name": "Create the table if missing",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "parameters": {
+        "resource": "table",
+        "operation": "create",
+        "tableName": "lead_scores",
+        "columns": {
+          "column": [
+            {
+              "name": "run_id",
+              "type": "string"
+            },
+            {
+              "name": "scored_at",
+              "type": "string"
+            },
+            {
+              "name": "mode",
+              "type": "string"
+            },
+            {
+              "name": "lead_id",
+              "type": "string"
+            },
+            {
+              "name": "company",
+              "type": "string"
+            },
+            {
+              "name": "score",
+              "type": "number"
+            },
+            {
+              "name": "tier",
+              "type": "string"
+            },
+            {
+              "name": "reasons",
+              "type": "string"
+            },
+            {
+              "name": "known_outcome",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {
+          "createIfNotExists": true
+        }
+      },
+      "position": [
+        1200,
+        0
+      ]
+    },
+    {
+      "name": "One row per lead",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "// One row per lead, tagged with the run, ready for the data table.\nconst runId = $('Backtest').first().json.runId;\nconst scoredAt = new Date().toISOString();\nreturn $('Score each lead').all().map(i => ({ json: { run_id: runId, scored_at: scoredAt, mode: 'shadow', ...i.json } }));"
+      },
+      "position": [
+        1440,
+        0
+      ]
+    },
+    {
+      "name": "Save the scores",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "lead_scores"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "position": [
+        1680,
+        0
+      ]
+    },
+    {
+      "name": "Show the backtest",
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 2.5,
+      "webhookId": "lead-scoring-done",
+      "executeOnce": true,
+      "parameters": {
+        "operation": "completion",
+        "respondWith": "showText",
+        "responseText": "={{ $('Backtest').first().json.summaryHtml }}"
+      },
+      "position": [
+        1920,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Upload leads": {
+      "main": [
+        [
+          {
+            "node": "Read the CSV",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read the CSV": {
+      "main": [
+        [
+          {
+            "node": "Scoring rules (edit me)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Scoring rules (edit me)": {
+      "main": [
+        [
+          {
+            "node": "Score each lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Score each lead": {
+      "main": [
+        [
+          {
+            "node": "Backtest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Backtest": {
+      "main": [
+        [
+          {
+            "node": "Create the table if missing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create the table if missing": {
+      "main": [
+        [
+          {
+            "node": "One row per lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "One row per lead": {
+      "main": [
+        [
+          {
+            "node": "Save the scores",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save the scores": {
+      "main": [
+        [
+          {
+            "node": "Show the backtest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

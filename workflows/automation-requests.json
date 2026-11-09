@@ -1,0 +1,371 @@
+{
+  "name": "Automation request triage",
+  "nodes": [
+    {
+      "name": "Automation request",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.2,
+      "webhookId": "automation-request",
+      "parameters": {
+        "formTitle": "Automation request",
+        "formDescription": "Tell us about a task you do by hand. We estimate the time it costs, check how well it suits automation, and put it in the queue.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Your name",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Team",
+              "fieldType": "dropdown",
+              "fieldOptions": {
+                "values": [
+                  {
+                    "option": "Sales"
+                  },
+                  {
+                    "option": "Client success"
+                  },
+                  {
+                    "option": "Marketing"
+                  },
+                  {
+                    "option": "Finance"
+                  },
+                  {
+                    "option": "Operations"
+                  },
+                  {
+                    "option": "Other"
+                  }
+                ]
+              },
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "What do you do by hand today?",
+              "fieldType": "textarea",
+              "placeholder": "The steps, where the data comes from, where it goes",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Tools involved",
+              "placeholder": "e.g. CRM, spreadsheets, email"
+            },
+            {
+              "fieldLabel": "How often",
+              "fieldType": "dropdown",
+              "fieldOptions": {
+                "values": [
+                  {
+                    "option": "Daily"
+                  },
+                  {
+                    "option": "Weekly"
+                  },
+                  {
+                    "option": "Monthly"
+                  }
+                ]
+              },
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Minutes each time",
+              "fieldType": "number",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "People doing it",
+              "fieldType": "number",
+              "requiredField": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "name": "Hours per month",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "// Turn the request into hours per month, the number the priority is based on.\nconst r = $input.first().json;\nconst perMonth = { Daily: 21, Weekly: 4.33, Monthly: 1 };\nconst minutes = Number(r['Minutes each time']) || 0;\nconst people = Math.max(1, Number(r['People doing it']) || 1);\nconst hoursPerMonth = Math.round((minutes * (perMonth[r['How often']] ?? 1) * people / 60) * 10) / 10;\nreturn [{ json: { ...r, minutes, people, hoursPerMonth } }];"
+      },
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "name": "Classify the request (Gemini)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  system_instruction: { parts: [{ text: 'You triage internal automation requests for an operations team. Reply with JSON only. Schema: {\"category\": one of [\"data entry\", \"reporting\", \"notifications\", \"document generation\", \"system sync\", \"other\"], \"automation_fit\": one of [\"high\", \"medium\", \"low\"], \"summary\": string (one sentence: what the requester wants), \"suggested_approach\": string (two sentences max; describe the kind of tool, not a vendor), \"risk\": string (one sentence: what goes wrong if this is automated badly), \"question_for_requester\": string (the one question that would most change the estimate, or an empty string)}. Fit is high when the steps follow rules and the inputs are structured, low when every case needs judgment.' }] },\n  contents: [{ role: 'user', parts: [{ text: 'Team: ' + $json['Team'] + '\\nTools: ' + ($json['Tools involved'] || 'not stated') + '\\nHow often: ' + $json['How often'] + ', ' + $json.minutes + ' minutes each time, ' + $json.people + ' people\\n\\nWhat they do by hand today:\\n' + $json['What do you do by hand today?'] }] }],\n  generationConfig: { responseMimeType: 'application/json', temperature: 0.2 }\n}) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput",
+      "position": [
+        480,
+        0
+      ]
+    },
+    {
+      "name": "Score and set priority",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "// Score the request and decide the priority. If the model failed, the request is still logged for manual triage.\nconst req = $('Hours per month').first().json;\nconst out = $input.first().json;\nconst esc = s => String(s ?? '').replace(/[&<>\"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' }[c]));\n\nlet ai = null;\ntry {\n  let text = out.candidates?.[0]?.content?.parts?.[0]?.text ?? '';\n  text = text.replace(/^```(?:json)?\\s*/i, '').replace(/```\\s*$/i, '').trim();\n  ai = JSON.parse(text);\n} catch (e) {\n  ai = null;\n}\nconst fits = ['high', 'medium', 'low'];\nif (!ai || !fits.includes(ai.automation_fit)) {\n  ai = { category: 'needs manual triage', automation_fit: 'unknown', summary: '', suggested_approach: 'The model did not answer. Triage by hand.', risk: '', question_for_requester: '' };\n}\n\n// Hours saved per month, discounted by how well the work suits automation.\nconst weight = { high: 1, medium: 0.6, low: 0.25, unknown: 0.5 }[ai.automation_fit];\nconst score = Math.round(req.hoursPerMonth * weight * 10) / 10;\nconst priority = score >= 10 ? 'P1' : score >= 3 ? 'P2' : 'P3';\nconst requestId = 'AR-' + String($execution.id).padStart(4, '0');\n\nconst row = {\n  request_id: requestId,\n  submitted_at: new Date().toISOString(),\n  requester: String(req['Your name'] ?? ''),\n  team: String(req['Team'] ?? ''),\n  task: String(req['What do you do by hand today?'] ?? ''),\n  tools: String(req['Tools involved'] ?? ''),\n  frequency: String(req['How often'] ?? ''),\n  minutes_each: req.minutes,\n  people: req.people,\n  hours_per_month: req.hoursPerMonth,\n  category: String(ai.category ?? ''),\n  automation_fit: ai.automation_fit,\n  score,\n  priority,\n  suggested_approach: String(ai.suggested_approach ?? ''),\n  risk: String(ai.risk ?? ''),\n  question: String(ai.question_for_requester ?? ''),\n  status: 'new',\n};\n\nconst resultHtml = `\n<h2>${esc(requestId)} logged, priority ${esc(priority)}</h2>\n<p>${esc(ai.summary)}</p>\n<p><b>Time spent today:</b> about ${esc(req.hoursPerMonth)} hours a month. <b>Fit for automation:</b> ${esc(ai.automation_fit)} (${esc(ai.category)}). <b>Score:</b> ${esc(score)}.</p>\n<p><b>Suggested approach:</b> ${esc(ai.suggested_approach)}</p>\n${ai.risk ? `<p><b>Watch out for:</b> ${esc(ai.risk)}</p>` : ''}\n${ai.question_for_requester ? `<p><b>One question back to you:</b> ${esc(ai.question_for_requester)}</p>` : ''}`;\n\nreturn [{ json: { row, resultHtml } }];"
+      },
+      "position": [
+        720,
+        0
+      ]
+    },
+    {
+      "name": "Create the table if missing",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "parameters": {
+        "resource": "table",
+        "operation": "create",
+        "tableName": "automation_requests",
+        "columns": {
+          "column": [
+            {
+              "name": "request_id",
+              "type": "string"
+            },
+            {
+              "name": "submitted_at",
+              "type": "string"
+            },
+            {
+              "name": "requester",
+              "type": "string"
+            },
+            {
+              "name": "team",
+              "type": "string"
+            },
+            {
+              "name": "task",
+              "type": "string"
+            },
+            {
+              "name": "tools",
+              "type": "string"
+            },
+            {
+              "name": "frequency",
+              "type": "string"
+            },
+            {
+              "name": "minutes_each",
+              "type": "number"
+            },
+            {
+              "name": "people",
+              "type": "number"
+            },
+            {
+              "name": "hours_per_month",
+              "type": "number"
+            },
+            {
+              "name": "category",
+              "type": "string"
+            },
+            {
+              "name": "automation_fit",
+              "type": "string"
+            },
+            {
+              "name": "score",
+              "type": "number"
+            },
+            {
+              "name": "priority",
+              "type": "string"
+            },
+            {
+              "name": "suggested_approach",
+              "type": "string"
+            },
+            {
+              "name": "risk",
+              "type": "string"
+            },
+            {
+              "name": "question",
+              "type": "string"
+            },
+            {
+              "name": "status",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {
+          "createIfNotExists": true
+        }
+      },
+      "position": [
+        960,
+        0
+      ]
+    },
+    {
+      "name": "Row for the queue",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "return [{ json: $('Score and set priority').first().json.row }];"
+      },
+      "position": [
+        1200,
+        0
+      ]
+    },
+    {
+      "name": "Add to the queue",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "automation_requests"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "position": [
+        1440,
+        0
+      ]
+    },
+    {
+      "name": "Confirmation",
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 2.5,
+      "webhookId": "automation-request-done",
+      "executeOnce": true,
+      "parameters": {
+        "operation": "completion",
+        "respondWith": "showText",
+        "responseText": "={{ $('Score and set priority').first().json.resultHtml }}"
+      },
+      "position": [
+        1680,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Automation request": {
+      "main": [
+        [
+          {
+            "node": "Hours per month",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hours per month": {
+      "main": [
+        [
+          {
+            "node": "Classify the request (Gemini)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify the request (Gemini)": {
+      "main": [
+        [
+          {
+            "node": "Score and set priority",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Score and set priority": {
+      "main": [
+        [
+          {
+            "node": "Create the table if missing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create the table if missing": {
+      "main": [
+        [
+          {
+            "node": "Row for the queue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Row for the queue": {
+      "main": [
+        [
+          {
+            "node": "Add to the queue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Add to the queue": {
+      "main": [
+        [
+          {
+            "node": "Confirmation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}
