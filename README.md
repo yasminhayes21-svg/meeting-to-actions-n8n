@@ -43,10 +43,16 @@ Open the Gemini node, create the Header Auth credential once, and pick it in the
 
 A meeting transcript goes in. Decisions and action items come out, a person reviews them, and only approved actions are saved.
 
-```
-Form (transcript) -> Gemini (structured JSON) -> Parse -> Review page: approve?
-                                                            yes: create table if missing -> one row per action -> recap page
-                                                            no:  "nothing was saved" page
+```mermaid
+flowchart LR
+    A[/"Form: title, date, transcript"/] --> B["Gemini: summary, decisions, actions as JSON"]
+    B --> C{"Valid JSON?"}
+    C -- no --> X["Stop with a clear error"]
+    C -- yes --> D["Review page"]
+    D --> E{"Approved?"}
+    E -- yes --> F[("meeting_actions table")]
+    F --> G["Recap page"]
+    E -- no --> H["Nothing saved"]
 ```
 
 1. **Intake.** A form takes the meeting title, date and the pasted transcript.
@@ -63,8 +69,16 @@ Form (transcript) -> Gemini (structured JSON) -> Parse -> Review page: approve?
 
 Anyone in the company describes a task they do by hand. The workflow estimates what it costs, judges how well it suits automation, and puts it in a priority queue.
 
-```
-Form -> hours per month (code) -> Gemini: category, fit, approach, risk -> score and priority (code) -> automation_requests table -> confirmation page
+```mermaid
+flowchart LR
+    A[/"Form: task, how often, minutes, people"/] --> B["Code: hours per month"]
+    B --> C["Gemini: category, fit, approach, risk, question"]
+    C --> D{"Model answered?"}
+    D -- yes --> E["Code: score = hours x fit weight, priority P1 to P3"]
+    D -- no --> F["Fit unknown: needs manual triage"]
+    F --> E
+    E --> G[("automation_requests table")]
+    G --> H["Confirmation page: ID and priority"]
 ```
 
 1. **Intake.** Name, team, what they do by hand, tools, how often, minutes each time, how many people.
@@ -81,8 +95,17 @@ If Gemini does not answer, the request is still logged with fit `unknown` and ca
 
 A CSV of leads goes in. Every lead gets a score, a tier and the reasons. If the file says which leads converted, the workflow checks whether the tiers would have predicted it, before anyone trusts the score.
 
-```
-Form (CSV upload) -> read CSV -> scoring rules (edit me) -> score each lead -> backtest -> lead_scores table -> results page
+```mermaid
+flowchart LR
+    A[/"Upload leads CSV"/] --> B["Read the CSV"]
+    B --> C["Scoring rules (edit me)"]
+    C --> D["Score each lead, with reasons"]
+    D --> E{"Outcomes in the file?"}
+    E -- yes --> F["Backtest: conversion rate and lift per tier"]
+    E -- no --> G["Shadow run only"]
+    F --> H[("lead_scores table, mode shadow")]
+    G --> H
+    H --> I["Results page: verdict and top five"]
 ```
 
 1. **Rules in one place.** The `Scoring rules (edit me)` node holds every weight: company size bands, target industries and markets, buyer seniority, demo requests, site visits and email clicks, and the tier cut-offs.
@@ -98,8 +121,18 @@ No credential needed: the scoring is rules, not a model, so it is cheap, fast an
 
 An email campaign export goes in. A report with rates, flags and a written commentary comes out, with every number in the commentary checked against the data.
 
-```
-Form (title + CSV) -> read CSV -> compute the metrics (code) -> Gemini commentary -> check the numbers -> campaign_metrics table -> report page
+```mermaid
+flowchart LR
+    A[/"Upload campaign export CSV"/] --> B["Code: rates and flags"]
+    B --> C["Gemini: headline and three points"]
+    C --> D{"Every number in the data?"}
+    D -- yes --> E["Marked as matching"]
+    D -- no --> F["Shown in red: check before sending"]
+    C -. no answer .-> N["Report without commentary"]
+    E --> G[("campaign_metrics table, upsert")]
+    F --> G
+    N --> G
+    G --> H["Report page"]
 ```
 
 1. **Metrics in code.** Open, click, click-to-open, unsubscribe and bounce rates per campaign and in total, plus flags: bounces above 2%, unsubscribes above 0.5%, opens below 20%.
